@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="background">#0E1116</color>
+    <color name="surface">#1A1F29</color>
+    <color name="surface_focused">#242B38</color>
+    <color name="surface_selected">#202634</color>
+    <color name="outline">#333B4A</color>
+    <color name="accent">#2F7BF6</color>
+    <color name="accent_bright">#5A96FF</color>
+    <color name="text_primary">#F2F4F8</color>
+    <color name="text_secondary">#98A1B3</color>
+    <color name="overlay_background">#CC000000</color>
+    <color name="error">#FF5A5A</color>
+    <color name="favorite">#FFC53D</color>
+</resources>

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">XtreamTV</string>
+
+    <!-- Login -->
+    <string name="login_tagline">Sign in with your Xtream Codes provider\nto start watching</string>
+    <string name="login_hint_url">Provider URL (e.g. http://host:8080)</string>
+    <string name="login_hint_username">Username</string>
+    <string name="login_hint_password">Password</string>
+    <string name="login_connect">Connect</string>
+    <string name="login_error_missing_fields">Please fill in the URL, username and password.</string>
+    <string name="login_error_invalid_credentials">Login failed — check your username and password.</string>
+    <string name="login_error_account_status">Login refused — account status: %1$s</string>
+    <string name="login_error_connection">Could not reach the server: %1$s</string>
+
+    <!-- Dashboard -->
+    <string name="tab_live">Live TV</string>
+    <string name="tab_movies">Movies</string>
+    <string name="tab_series">TV Shows</string>
+
+    <!-- Live TV -->
+    <string name="category_favorites">★ Favorites</string>
+    <string name="category_unnamed">Unnamed</string>
+    <string name="category_empty">No channels in this category.</string>
+    <string name="favorites_empty_hint">No favorites yet.\nHighlight a channel and press the YELLOW button to add it.</string>
+    <string name="favorites_added">Added “%1$s” to Favorites</string>
+    <string name="favorites_removed">Removed “%1$s” from Favorites</string>
+
+    <!-- Movies / Series -->
+    <string name="movies_empty">No movies available.</string>
+    <string name="series_empty">No TV shows available.</string>
+    <string name="series_no_episodes">No episodes found for this season.</string>
+    <string name="season_label">Season %1$s</string>
+    <string name="episode_fallback">Episode %1$d</string>
+
+    <!-- Player -->
+    <string name="player_reconnecting">Stream problem — reconnecting (%1$d/%2$d)…</string>
+    <string name="player_failed">Unable to play this stream. Press Back and try again.</string>
+    <string name="player_favorite_added">Added to Favorites</string>
+    <string name="player_favorite_removed">Removed from Favorites</string>
+    <string name="player_aspect">Aspect ratio: %1$s</string>
+    <string name="aspect_fit">Fit</string>
+    <string name="aspect_zoom">Zoom</string>
+    <string name="aspect_stretch">Stretch</string>
+
+    <!-- Shared -->
+    <string name="error_loading">Could not load content: %1$s</string>
+    <string name="error_loading_retry">Could not load content: %1$s\n\nPress OK to retry.</string>
+    <string name="error_no_session">Session expired — please sign in again.</string>
+</resources>
