@@ -2,22 +2,43 @@ package com.xtreamtv.ui.live
 
 import android.os.Bundle
 import android.view.View
+import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.OnBackPressedCallback
 import androidx.fragment.app.Fragment
 import androidx.leanback.widget.VerticalGridView
 import androidx.lifecycle.lifecycleScope
+import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackException
+import com.google.android.exoplayer2.Player
+import com.google.android.exoplayer2.ui.AspectRatioFrameLayout
+import com.google.android.exoplayer2.ui.StyledPlayerView
 import com.xtreamtv.App
 import com.xtreamtv.R
 import com.xtreamtv.data.model.Category
+import com.xtreamtv.data.model.EpgEntry
 import com.xtreamtv.data.model.LiveStream
+import com.xtreamtv.ui.MainActivity
 import com.xtreamtv.ui.common.CategoryAdapter
 import com.xtreamtv.ui.common.CategoryRow
-import com.xtreamtv.ui.player.PlayerActivity
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
+/**
+ * Live TV browser with an embedded preview player (TiviMate-style):
+ * categories | channel list | docked player + now-playing/EPG panel.
+ *
+ * OK on a channel tunes it in the docked player; OK on the channel that is
+ * already playing expands to fullscreen; BACK collapses back to browsing.
+ * One ExoPlayer instance is shared between the docked and fullscreen surfaces,
+ * so browsing and expanding never interrupt playback.
+ */
 class LiveTvFragment : Fragment(R.layout.fragment_live) {
 
     private lateinit var app: App
@@ -25,6 +46,15 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     private lateinit var channelGrid: VerticalGridView
     private lateinit var progress: ProgressBar
     private lateinit var emptyText: TextView
+    private lateinit var miniPlayerView: StyledPlayerView
+    private lateinit var fullscreenContainer: FrameLayout
+    private lateinit var fullscreenPlayerView: StyledPlayerView
+    private lateinit var fullscreenStatus: TextView
+    private lateinit var playerStatus: TextView
+    private lateinit var nowChannelName: TextView
+    private lateinit var nowChannelNumber: TextView
+    private lateinit var epgNow: TextView
+    private lateinit var epgNext: TextView
     private lateinit var categoryAdapter: CategoryAdapter
     private lateinit var channelAdapter: ChannelAdapter
 
@@ -37,17 +67,20 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     private var loading = false
     private var pendingJumpToFavorites = false
 
-    private val playerLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-            // Favorites may have been toggled inside the player.
-            if (result.resultCode == PlayerActivity.RESULT_JUMP_TO_FAVORITES) {
-                jumpToFavorites()
-            } else if (selectedCategoryId == FAVORITES_CATEGORY_ID) {
-                refreshChannels()
-            } else {
-                channelAdapter.notifyDataSetChanged()
-            }
+    private var player: ExoPlayer? = null
+    private var currentChannel: LiveStream? = null
+    private var isFullscreen = false
+    private var playbackFailed = false
+    private var retryCount = 0
+    private var retryJob: Job? = null
+    private var epgJob: Job? = null
+    private var resizeModeIndex = 0
+
+    private val backCallback = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            exitFullscreen()
         }
+    }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
@@ -57,6 +90,20 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         channelGrid = view.findViewById(R.id.channel_grid)
         progress = view.findViewById(R.id.live_progress)
         emptyText = view.findViewById(R.id.live_empty)
+        miniPlayerView = view.findViewById(R.id.mini_player)
+        fullscreenContainer = view.findViewById(R.id.fullscreen_container)
+        fullscreenPlayerView = view.findViewById(R.id.fullscreen_player)
+        fullscreenStatus = view.findViewById(R.id.fullscreen_status)
+        playerStatus = view.findViewById(R.id.player_status)
+
+        // OK while fullscreen retries a dead stream (controller is disabled).
+        fullscreenPlayerView.setOnClickListener {
+            if (playbackFailed) currentChannel?.let(::startChannelStream)
+        }
+        nowChannelName = view.findViewById(R.id.now_channel_name)
+        nowChannelNumber = view.findViewById(R.id.now_channel_number)
+        epgNow = view.findViewById(R.id.epg_now)
+        epgNext = view.findViewById(R.id.epg_next)
 
         categoryAdapter = CategoryAdapter(
             onFocused = { row -> selectCategory(row.id) },
@@ -70,9 +117,9 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         channelAdapter = ChannelAdapter(
             isFavorite = { id -> app.favorites.isFavorite(id) },
             onFocused = { channel -> focusedChannel = channel },
-            onClicked = { channel -> play(channel) }
+            onClicked = { channel -> playChannel(channel) }
         )
-        channelGrid.setNumColumns(GRID_COLUMNS)
+        channelGrid.setNumColumns(1)
         channelGrid.adapter = channelAdapter
 
         // Empty leanback grids still accept (and swallow) D-pad focus with no
@@ -80,6 +127,9 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         categoryList.isFocusable = false
         channelGrid.isFocusable = false
 
+        requireActivity().onBackPressedDispatcher.addCallback(viewLifecycleOwner, backCallback)
+
+        updateNowPlaying(null)
         load()
     }
 
@@ -88,12 +138,29 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         if (!loaded) load()
     }
 
+    override fun onStart() {
+        super.onStart()
+        if (!isHidden) resumePlayback()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        releasePlayer()
+    }
+
     override fun onHiddenChanged(hidden: Boolean) {
         super.onHiddenChanged(hidden)
-        // Fragments are kept alive across tab switches; retry a failed load
-        // whenever the tab comes back into view.
-        if (!hidden && !loaded) load()
+        if (hidden) {
+            // Don't stream (or stay fullscreen) behind the Movies/Shows tabs.
+            if (isFullscreen) exitFullscreen()
+            releasePlayer()
+        } else {
+            if (!loaded) load()
+            resumePlayback()
+        }
     }
+
+    // ---- Catalog ----
 
     private fun load() {
         if (loading || loaded) return
@@ -187,7 +254,29 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         emptyText.visibility = if (channels.isEmpty() && loaded) View.VISIBLE else View.GONE
     }
 
-    private fun play(channel: LiveStream) {
+    // ---- Playback ----
+
+    private fun playChannel(channel: LiveStream) {
+        val streamId = channel.streamId ?: return
+        // OK on the channel that's already playing expands it to fullscreen
+        // (unless it's in a failed state — then OK retries).
+        if (currentChannel?.streamId == streamId && player != null && !playbackFailed) {
+            enterFullscreen()
+            return
+        }
+        currentChannel = channel
+        channelAdapter.setPlayingId(streamId)
+        updateNowPlaying(channel)
+        fetchEpg(streamId)
+        startChannelStream(channel)
+    }
+
+    private fun resumePlayback() {
+        val channel = currentChannel ?: return
+        if (player == null && view != null) startChannelStream(channel)
+    }
+
+    private fun startChannelStream(channel: LiveStream) {
         val streamId = channel.streamId ?: return
         val url = try {
             app.api.liveStreamUrl(streamId)
@@ -195,17 +284,202 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
             Toast.makeText(requireContext(), R.string.error_no_session, Toast.LENGTH_SHORT).show()
             return
         }
-        playerLauncher.launch(
-            PlayerActivity.liveIntent(requireContext(), url, channel.name.orEmpty(), streamId)
-        )
+        playbackFailed = false
+        retryCount = 0
+        retryJob?.cancel()
+        showStatus(getString(R.string.player_loading))
+        val exo = ensurePlayer()
+        exo.setMediaItem(MediaItem.fromUri(url))
+        exo.prepare()
+        exo.playWhenReady = true
     }
 
-    /** Yellow button: toggle the focused channel in/out of Favorites. */
+    private fun ensurePlayer(): ExoPlayer {
+        player?.let { return it }
+        val exo = ExoPlayer.Builder(requireContext()).build()
+        exo.addListener(playerListener)
+        (if (isFullscreen) fullscreenPlayerView else miniPlayerView).player = exo
+        player = exo
+        return exo
+    }
+
+    private val playerListener = object : Player.Listener {
+        override fun onPlaybackStateChanged(playbackState: Int) {
+            when (playbackState) {
+                Player.STATE_READY -> {
+                    retryCount = 0
+                    playbackFailed = false
+                    hideStatus()
+                }
+                // Live .ts hitting clean EOF (provider closed the connection)
+                // ends without an error — reconnect anyway.
+                Player.STATE_ENDED -> scheduleRetry()
+            }
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            // Hold the screen awake only while actually playing, on whichever
+            // surface is active — a dead stream shouldn't pin the screen.
+            miniPlayerView.keepScreenOn = isPlaying
+            fullscreenPlayerView.keepScreenOn = isPlaying
+        }
+
+        override fun onPlayerError(error: PlaybackException) {
+            scheduleRetry()
+        }
+    }
+
+    /** Status text is mirrored onto the fullscreen overlay so stream problems
+     *  are never silently hidden behind the fullscreen surface. */
+    private fun showStatus(text: String) {
+        playerStatus.text = text
+        playerStatus.visibility = View.VISIBLE
+        fullscreenStatus.text = text
+        fullscreenStatus.visibility = if (isFullscreen) View.VISIBLE else View.GONE
+    }
+
+    private fun hideStatus() {
+        playerStatus.visibility = View.GONE
+        fullscreenStatus.visibility = View.GONE
+    }
+
+    private fun scheduleRetry() {
+        if (retryCount >= MAX_RETRIES) {
+            playbackFailed = true
+            showStatus(getString(R.string.player_failed_mini))
+            return
+        }
+        retryCount++
+        showStatus(getString(R.string.player_reconnecting, retryCount, MAX_RETRIES))
+        retryJob?.cancel()
+        retryJob = viewLifecycleOwner.lifecycleScope.launch {
+            delay(RETRY_DELAY_MS)
+            val streamId = currentChannel?.streamId ?: return@launch
+            val url = runCatching { app.api.liveStreamUrl(streamId) }.getOrNull() ?: return@launch
+            player?.let { exo ->
+                exo.stop()
+                exo.setMediaItem(MediaItem.fromUri(url))
+                exo.prepare()
+                exo.play()
+            }
+        }
+    }
+
+    private fun releasePlayer() {
+        retryJob?.cancel()
+        player?.release()
+        player = null
+        miniPlayerView.player = null
+        fullscreenPlayerView.player = null
+    }
+
+    // ---- Now playing / EPG panel ----
+
+    private fun updateNowPlaying(channel: LiveStream?) {
+        epgNow.visibility = View.GONE
+        epgNext.visibility = View.GONE
+        if (channel == null) {
+            nowChannelName.text = ""
+            nowChannelNumber.visibility = View.GONE
+            playerStatus.text = getString(R.string.live_select_channel)
+            playerStatus.visibility = View.VISIBLE
+            return
+        }
+        nowChannelName.text = channel.name.orEmpty()
+        val num = channel.num
+        if (num != null) {
+            nowChannelNumber.text = getString(R.string.channel_number_format, num)
+            nowChannelNumber.visibility = View.VISIBLE
+        } else {
+            nowChannelNumber.visibility = View.GONE
+        }
+    }
+
+    private fun fetchEpg(streamId: Int) {
+        epgJob?.cancel()
+        epgJob = viewLifecycleOwner.lifecycleScope.launch {
+            val listings = try {
+                app.api.getShortEpg(streamId)
+            } catch (e: CancellationException) {
+                throw e // never swallow cancellation — a superseded fetch must not bind
+            } catch (e: Exception) {
+                emptyList()
+            }
+            ensureActive()
+            if (currentChannel?.streamId != streamId) return@launch
+            bindEpgLine(epgNow, getString(R.string.epg_now_label), listings.getOrNull(0))
+            bindEpgLine(epgNext, getString(R.string.epg_next_label), listings.getOrNull(1))
+        }
+    }
+
+    private fun bindEpgLine(view: TextView, label: String, entry: EpgEntry?) {
+        val title = entry?.title?.takeIf { it.isNotBlank() }
+        if (title == null) {
+            view.visibility = View.GONE
+            return
+        }
+        view.text = listOfNotNull(label, timeRange(entry).takeIf { it.isNotBlank() }, title)
+            .joinToString("  •  ")
+        view.visibility = View.VISIBLE
+    }
+
+    /** "2026-08-06 20:00:00" / "...21:00:00" -> "20:00–21:00" (panel-local time). */
+    private fun timeRange(entry: EpgEntry): String {
+        fun clock(stamp: String?): String? =
+            stamp?.takeIf { it.length >= 16 }?.substring(11, 16)
+        val start = clock(entry.start)
+        val end = clock(entry.end)
+        return when {
+            start != null && end != null -> "$start–$end"
+            start != null -> start
+            else -> ""
+        }
+    }
+
+    // ---- Fullscreen ----
+
+    private fun enterFullscreen() {
+        val exo = player ?: return
+        if (isFullscreen) return
+        isFullscreen = true
+        (activity as? MainActivity)?.setTabRailVisible(false)
+        fullscreenContainer.visibility = View.VISIBLE
+        // Carry any active status message (reconnecting/failed) onto the
+        // fullscreen overlay.
+        fullscreenStatus.text = playerStatus.text
+        fullscreenStatus.visibility = playerStatus.visibility
+        StyledPlayerView.switchTargetView(exo, miniPlayerView, fullscreenPlayerView)
+        fullscreenPlayerView.requestFocus()
+        backCallback.isEnabled = true
+    }
+
+    fun exitFullscreen() {
+        if (!isFullscreen) return
+        isFullscreen = false
+        player?.let { StyledPlayerView.switchTargetView(it, fullscreenPlayerView, miniPlayerView) }
+        fullscreenContainer.visibility = View.GONE
+        fullscreenStatus.visibility = View.GONE
+        (activity as? MainActivity)?.setTabRailVisible(true)
+        backCallback.isEnabled = false
+        if (channelAdapter.itemCount > 0) {
+            channelGrid.requestFocus()
+        } else {
+            categoryList.requestFocus()
+        }
+    }
+
+    // ---- Hardware color keys ----
+
+    /** Yellow: toggle the focused (browsing) or playing (fullscreen) channel. */
     fun handleYellowKey(): Boolean {
-        // Only act when the channel grid itself is focused — otherwise a press
-        // from the rail/tabs would toggle a stale, off-screen channel.
-        if (!channelGrid.hasFocus()) return false
-        val channel = focusedChannel ?: return false
+        val channel = if (isFullscreen) {
+            currentChannel
+        } else {
+            // Only act when the channel list itself is focused — otherwise a
+            // press from the rail/tabs would toggle a stale, off-screen item.
+            if (!channelGrid.hasFocus()) return false
+            focusedChannel
+        } ?: return false
         val streamId = channel.streamId ?: return false
         val added = app.favorites.toggle(streamId)
         Toast.makeText(
@@ -224,8 +498,23 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         return true
     }
 
+    /** Green: cycle aspect ratio while fullscreen. */
+    fun handleGreenKey(): Boolean {
+        if (!isFullscreen) return false
+        resizeModeIndex = (resizeModeIndex + 1) % RESIZE_MODES.size
+        val (mode, labelRes) = RESIZE_MODES[resizeModeIndex]
+        fullscreenPlayerView.resizeMode = mode
+        Toast.makeText(
+            requireContext(),
+            getString(R.string.player_aspect, getString(labelRes)),
+            Toast.LENGTH_SHORT
+        ).show()
+        return true
+    }
+
     /** Blue button: jump straight to the Favorites category row. */
     fun jumpToFavorites() {
+        if (isFullscreen) exitFullscreen()
         if (!loaded) {
             pendingJumpToFavorites = true
             load()
@@ -252,6 +541,13 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
 
     companion object {
         const val FAVORITES_CATEGORY_ID = "__favorites__"
-        private const val GRID_COLUMNS = 3
+        private const val MAX_RETRIES = 3
+        private const val RETRY_DELAY_MS = 3000L
+
+        private val RESIZE_MODES = listOf(
+            AspectRatioFrameLayout.RESIZE_MODE_FIT to R.string.aspect_fit,
+            AspectRatioFrameLayout.RESIZE_MODE_ZOOM to R.string.aspect_zoom,
+            AspectRatioFrameLayout.RESIZE_MODE_FILL to R.string.aspect_stretch
+        )
     }
 }

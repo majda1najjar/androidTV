@@ -18,6 +18,7 @@ class ChannelAdapter(
 ) : RecyclerView.Adapter<ChannelAdapter.ViewHolder>() {
 
     private val items = mutableListOf<LiveStream>()
+    private var playingId: Int? = null
 
     fun submit(channels: List<LiveStream>) {
         items.clear()
@@ -30,9 +31,18 @@ class ChannelAdapter(
         if (index >= 0) notifyItemChanged(index)
     }
 
+    /** Marks the row of the channel currently playing in the preview player. */
+    fun setPlayingId(streamId: Int?) {
+        if (playingId == streamId) return
+        val previous = playingId
+        playingId = streamId
+        previous?.let(::notifyChannelChanged)
+        streamId?.let(::notifyChannelChanged)
+    }
+
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
-            .inflate(R.layout.item_channel, parent, false)
+            .inflate(R.layout.item_channel_row, parent, false)
         return ViewHolder(view)
     }
 
@@ -40,6 +50,7 @@ class ChannelAdapter(
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val channel = items[position]
+        holder.itemView.isActivated = channel.streamId != null && channel.streamId == playingId
         holder.name.text = channel.name.orEmpty()
         holder.number.text = channel.num?.toString().orEmpty()
         holder.favoriteBadge.visibility =

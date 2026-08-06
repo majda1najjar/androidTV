@@ -83,15 +83,29 @@ class MainActivity : FragmentActivity() {
         else -> SeriesFragment()
     }
 
+    /** The Live tab hides the rail while its player is fullscreen. */
+    fun setTabRailVisible(visible: Boolean) {
+        findViewById<android.view.View>(R.id.tab_rail).visibility =
+            if (visible) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         when (keyCode) {
             KeyEvent.KEYCODE_PROG_YELLOW -> {
                 val live = liveFragment()
                 if (live != null && live.isVisible && live.handleYellowKey()) return true
             }
+            KeyEvent.KEYCODE_PROG_GREEN -> {
+                val live = liveFragment()
+                if (live != null && live.isVisible && live.handleGreenKey()) return true
+            }
             KeyEvent.KEYCODE_PROG_BLUE -> {
                 // Blue jumps to the Favorites row of Live TV from anywhere.
                 selectTab(0)
+                // The add() transaction is async; without this, the first Blue
+                // press from another tab after activity recreation finds no
+                // fragment and the jump is silently dropped.
+                supportFragmentManager.executePendingTransactions()
                 liveFragment()?.jumpToFavorites()
                 return true
             }

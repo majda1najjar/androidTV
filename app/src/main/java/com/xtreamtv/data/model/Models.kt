@@ -85,3 +85,10 @@ data class SeriesInfo(
     val info: SeriesDetails?,
     val episodes: Map<String, List<Episode>>
 )
+
+/** One programme from get_short_epg (title arrives base64-encoded). */
+data class EpgEntry(
+    val title: String?,
+    val start: String?,
+    val end: String?
+)

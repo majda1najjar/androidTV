@@ -19,6 +19,13 @@
     <string name="tab_series">TV Shows</string>
 
     <!-- Live TV -->
+    <string name="live_select_channel">Select a channel to start playback</string>
+    <string name="live_fullscreen_hint">Press OK on the playing channel for fullscreen · BACK returns here</string>
+    <string name="player_loading">Tuning…</string>
+    <string name="player_failed_mini">Stream unavailable — press OK to retry</string>
+    <string name="channel_number_format">Channel %1$d</string>
+    <string name="epg_now_label">Now</string>
+    <string name="epg_next_label">Next</string>
     <string name="category_favorites">★ Favorites</string>
     <string name="category_unnamed">Unnamed</string>
     <string name="category_empty">No channels in this category.</string>

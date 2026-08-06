@@ -1,5 +1,6 @@
 package com.xtreamtv.data
 
+import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.JsonArray
@@ -10,6 +11,7 @@ import com.google.gson.stream.JsonReader
 import com.google.gson.stream.JsonToken
 import com.google.gson.stream.JsonWriter
 import com.xtreamtv.data.model.Category
+import com.xtreamtv.data.model.EpgEntry
 import com.xtreamtv.data.model.Episode
 import com.xtreamtv.data.model.LiveStream
 import com.xtreamtv.data.model.LoginResponse
@@ -108,6 +110,41 @@ class XtreamApiClient(private val session: SessionManager) {
             }
         }
         return SeriesInfo(details, episodes)
+    }
+
+    /** Now/next programme info for a live channel; empty when the panel has no EPG. */
+    suspend fun getShortEpg(streamId: Int, limit: Int = 2): List<EpgEntry> {
+        val url = playerApiUrl(requireBaseUrl(), requireUser(), requirePass(), "get_short_epg")
+            .newBuilder()
+            .addQueryParameter("stream_id", streamId.toString())
+            .addQueryParameter("limit", limit.toString())
+            .build()
+        val body = fetch(url)
+        val root = runCatching { JsonParser.parseString(body) }.getOrNull() ?: return emptyList()
+        val listings = root.takeIf { it.isJsonObject }?.asJsonObject
+            ?.get("epg_listings")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?: return emptyList()
+        return listings.mapNotNull { element ->
+            val obj = element.takeIf { it.isJsonObject }?.asJsonObject ?: return@mapNotNull null
+            fun str(key: String): String? =
+                obj.get(key)?.takeIf { it.isJsonPrimitive }?.asString?.takeIf { it.isNotBlank() }
+            EpgEntry(decodeEpgTitle(str("title")), str("start"), str("end"))
+        }
+    }
+
+    // Titles are usually base64, but some panels send plain text — and short
+    // plain words ("News", "Golf") are themselves valid base64 that decodes to
+    // garbage. Prefer the decoded form only when it looks like real text.
+    private fun decodeEpgTitle(raw: String?): String? {
+        if (raw.isNullOrBlank()) return raw
+        val decoded = runCatching {
+            String(Base64.decode(raw, Base64.DEFAULT), Charsets.UTF_8).trim()
+        }.getOrNull() ?: runCatching {
+            String(Base64.decode(raw, Base64.URL_SAFE), Charsets.UTF_8).trim()
+        }.getOrNull()
+        val looksLikeText = !decoded.isNullOrBlank() &&
+            decoded.none { it == '�' || (it.isISOControl() && it != '\n') }
+        return if (looksLikeText) decoded else raw
     }
 
     // ---- Playback URLs ----

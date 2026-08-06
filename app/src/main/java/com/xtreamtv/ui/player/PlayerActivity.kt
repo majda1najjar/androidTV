@@ -15,16 +15,14 @@ import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.ui.AspectRatioFrameLayout
 import com.google.android.exoplayer2.ui.StyledPlayerView
-import com.xtreamtv.App
 import com.xtreamtv.R
 
 /**
- * Fullscreen ExoPlayer for live (.ts), VOD, and series streams.
+ * Fullscreen ExoPlayer for VOD and series episodes (live channels play inside
+ * LiveTvFragment's docked/fullscreen preview player instead).
  *
  * Hardware keys during playback:
- *   Yellow — toggle current live channel in/out of Favorites (overlay confirms)
- *   Blue   — stop playback and jump the channel browser to the Favorites row
- *   Green  — cycle aspect ratio (Fit / Zoom / Stretch)
+ *   Green — cycle aspect ratio (Fit / Zoom / Stretch)
  */
 class PlayerActivity : FragmentActivity() {
 
@@ -42,8 +40,6 @@ class PlayerActivity : FragmentActivity() {
     private lateinit var streamUrl: String
     private var streamTitle: String = ""
     private var titleShown = false
-    private var isLive = false
-    private var liveStreamId: Int = -1
     private var retryCount = 0
     private var resizeModeIndex = 0
     private var savedPosition = 0L
@@ -54,8 +50,6 @@ class PlayerActivity : FragmentActivity() {
 
         streamUrl = intent.getStringExtra(EXTRA_URL).orEmpty()
         streamTitle = intent.getStringExtra(EXTRA_TITLE).orEmpty()
-        isLive = intent.getStringExtra(EXTRA_TYPE) == TYPE_LIVE
-        liveStreamId = intent.getIntExtra(EXTRA_STREAM_ID, -1)
 
         playerView = findViewById(R.id.player_view)
         overlayToast = findViewById(R.id.overlay_toast)
@@ -87,9 +81,8 @@ class PlayerActivity : FragmentActivity() {
         exo.addListener(playerListener)
         retryCount = 0
         val item = MediaItem.fromUri(streamUrl)
-        // Resume VOD where the user left off after Home/screensaver; live
-        // always rejoins at the live edge.
-        if (!isLive && savedPosition > 0) {
+        // Resume where the user left off after Home/screensaver.
+        if (savedPosition > 0) {
             exo.setMediaItem(item, savedPosition)
         } else {
             exo.setMediaItem(item)
@@ -101,9 +94,7 @@ class PlayerActivity : FragmentActivity() {
     private fun releasePlayer() {
         handler.removeCallbacksAndMessages(null)
         player?.let { exo ->
-            if (!isLive) {
-                exo.currentPosition.takeIf { it > 0 }?.let { savedPosition = it }
-            }
+            exo.currentPosition.takeIf { it > 0 }?.let { savedPosition = it }
             playerView.player = null
             exo.release()
         }
@@ -120,34 +111,30 @@ class PlayerActivity : FragmentActivity() {
                         showOverlay(streamTitle)
                     }
                 }
-                Player.STATE_ENDED -> {
-                    // A live .ts that hits clean EOF (provider closed the
-                    // connection) ends without an error — reconnect anyway.
-                    if (isLive) attemptReconnect(resumePosition = false) else finish()
-                }
+                Player.STATE_ENDED -> finish()
             }
         }
 
         override fun onPlayerError(error: PlaybackException) {
-            // Providers drop streams routinely; reset and retry before giving up.
-            // VOD resumes where it was; live rejoins at the live edge.
-            attemptReconnect(resumePosition = !isLive)
+            // Providers drop streams routinely; reset and retry at the saved
+            // position before giving up.
+            attemptReconnect()
         }
     }
 
-    private fun attemptReconnect(resumePosition: Boolean) {
+    private fun attemptReconnect() {
         if (retryCount >= MAX_RETRIES) {
             showOverlay(getString(R.string.player_failed), LONG_OVERLAY_MS)
             return
         }
         retryCount++
         showOverlay(getString(R.string.player_reconnecting, retryCount, MAX_RETRIES))
-        val position = if (resumePosition) player?.currentPosition ?: 0L else 0L
+        val position = player?.currentPosition ?: 0L
         handler.postDelayed({
             player?.let { exo ->
                 exo.stop()
                 val item = MediaItem.fromUri(streamUrl)
-                if (resumePosition && position > 0) {
+                if (position > 0) {
                     exo.setMediaItem(item, position)
                 } else {
                     exo.setMediaItem(item)
@@ -160,34 +147,12 @@ class PlayerActivity : FragmentActivity() {
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         return when (keyCode) {
-            KeyEvent.KEYCODE_PROG_YELLOW -> {
-                toggleFavoriteState()
-                true
-            }
-            KeyEvent.KEYCODE_PROG_BLUE -> {
-                jumpToFavoritesCategory()
-                true
-            }
             KeyEvent.KEYCODE_PROG_GREEN -> {
                 cycleAspectRatio()
                 true
             }
             else -> super.onKeyDown(keyCode, event)
         }
-    }
-
-    private fun toggleFavoriteState() {
-        if (!isLive || liveStreamId <= 0) return
-        val added = App.from(this).favorites.toggle(liveStreamId)
-        showOverlay(
-            getString(if (added) R.string.player_favorite_added else R.string.player_favorite_removed)
-        )
-    }
-
-    private fun jumpToFavoritesCategory() {
-        if (!isLive) return
-        setResult(RESULT_JUMP_TO_FAVORITES)
-        finish()
     }
 
     private fun cycleAspectRatio() {
@@ -207,14 +172,8 @@ class PlayerActivity : FragmentActivity() {
     }
 
     companion object {
-        const val RESULT_JUMP_TO_FAVORITES = 71
-
         private const val EXTRA_URL = "url"
         private const val EXTRA_TITLE = "title"
-        private const val EXTRA_TYPE = "type"
-        private const val EXTRA_STREAM_ID = "stream_id"
-        private const val TYPE_LIVE = "live"
-        private const val TYPE_VOD = "vod"
 
         private const val MAX_RETRIES = 3
         private const val RETRY_DELAY_MS = 3000L
@@ -227,17 +186,9 @@ class PlayerActivity : FragmentActivity() {
             AspectRatioFrameLayout.RESIZE_MODE_FILL to R.string.aspect_stretch
         )
 
-        fun liveIntent(context: Context, url: String, title: String, streamId: Int): Intent =
-            Intent(context, PlayerActivity::class.java)
-                .putExtra(EXTRA_URL, url)
-                .putExtra(EXTRA_TITLE, title)
-                .putExtra(EXTRA_TYPE, TYPE_LIVE)
-                .putExtra(EXTRA_STREAM_ID, streamId)
-
         fun vodIntent(context: Context, url: String, title: String): Intent =
             Intent(context, PlayerActivity::class.java)
                 .putExtra(EXTRA_URL, url)
                 .putExtra(EXTRA_TITLE, title)
-                .putExtra(EXTRA_TYPE, TYPE_VOD)
     }
 }
