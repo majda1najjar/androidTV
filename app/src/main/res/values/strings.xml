@@ -20,6 +20,10 @@
 
     <!-- Live TV -->
     <string name="live_select_channel">Select a channel to start playback</string>
+    <string name="live_pick_category">Choose a category and press OK\nto load its channels</string>
+    <string name="search_hint">Search channels</string>
+    <string name="search_no_matches">No channels match “%1$s”</string>
+    <string name="category_all">All Channels</string>
     <string name="live_fullscreen_hint">Press OK on the playing channel for fullscreen · BACK returns here</string>
     <string name="player_loading">Tuning…</string>
     <string name="player_failed_mini">Stream unavailable — press OK to retry</string>

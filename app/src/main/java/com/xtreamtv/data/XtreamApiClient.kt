@@ -69,8 +69,12 @@ class XtreamApiClient(private val session: SessionManager) {
 
     suspend fun getSeriesCategories(): List<Category> = fetchList("get_series_categories")
 
-    suspend fun getLiveStreams(): List<LiveStream> =
-        fetchList<LiveStream>("get_live_streams").filter { it.streamId != null }
+    /** All live channels, or just one category's when [categoryId] is given. */
+    suspend fun getLiveStreams(categoryId: String? = null): List<LiveStream> =
+        fetchList<LiveStream>(
+            "get_live_streams",
+            if (categoryId != null) mapOf("category_id" to categoryId) else emptyMap()
+        ).filter { it.streamId != null }
 
     suspend fun getVodStreams(): List<VodStream> =
         fetchList<VodStream>("get_vod_streams").filter { it.streamId != null }
@@ -190,8 +194,15 @@ class XtreamApiClient(private val session: SessionManager) {
             runCatching { gson.fromJson(obj, Episode::class.java) }.getOrNull()
         }.filter { !it.id.isNullOrBlank() }
 
-    private suspend inline fun <reified T> fetchList(action: String): List<T> {
-        val body = fetch(playerApiUrl(requireBaseUrl(), requireUser(), requirePass(), action))
+    private suspend inline fun <reified T> fetchList(
+        action: String,
+        params: Map<String, String> = emptyMap()
+    ): List<T> {
+        val url = playerApiUrl(requireBaseUrl(), requireUser(), requirePass(), action)
+            .newBuilder()
+            .apply { params.forEach { (key, value) -> addQueryParameter(key, value) } }
+            .build()
+        val body = fetch(url)
         val element = runCatching { JsonParser.parseString(body) }.getOrNull()
             ?: throw IOException("Server returned malformed JSON")
         // Panels answer list requests with an object on failure (expired

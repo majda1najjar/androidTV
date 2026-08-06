@@ -1,12 +1,18 @@
 package com.xtreamtv.ui.live
 
+import android.content.Context
 import android.os.Bundle
 import android.view.View
+import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.core.widget.doAfterTextChanged
 import androidx.fragment.app.Fragment
 import androidx.leanback.widget.VerticalGridView
 import androidx.lifecycle.lifecycleScope
@@ -25,25 +31,33 @@ import com.xtreamtv.ui.MainActivity
 import com.xtreamtv.ui.common.CategoryAdapter
 import com.xtreamtv.ui.common.CategoryRow
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
 /**
  * Live TV browser with an embedded preview player (TiviMate-style):
- * categories | channel list | docked player + now-playing/EPG panel.
+ * categories | search + channel list | docked player + now-playing/EPG panel.
+ *
+ * Channels load lazily: focusing a category does nothing (so held D-pad
+ * scrolling stays smooth); pressing OK fetches that category's channels from
+ * the panel (cached afterwards). Favorites and the synthesized "All Channels"
+ * section pull the full channel list on demand. The search box above the
+ * channel list matches against all channels.
  *
  * OK on a channel tunes it in the docked player; OK on the channel that is
  * already playing expands to fullscreen; BACK collapses back to browsing.
- * One ExoPlayer instance is shared between the docked and fullscreen surfaces,
- * so browsing and expanding never interrupt playback.
  */
 class LiveTvFragment : Fragment(R.layout.fragment_live) {
 
     private lateinit var app: App
+    private lateinit var browseRoot: ViewGroup
     private lateinit var categoryList: VerticalGridView
     private lateinit var channelGrid: VerticalGridView
+    private lateinit var searchInput: EditText
     private lateinit var progress: ProgressBar
     private lateinit var emptyText: TextView
     private lateinit var miniPlayerView: StyledPlayerView
@@ -59,13 +73,19 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     private lateinit var channelAdapter: ChannelAdapter
 
     private var categories: List<Category> = emptyList()
-    private var channelsByCategory: Map<String, List<LiveStream>> = emptyMap()
-    private var allChannels: List<LiveStream> = emptyList()
+    private val channelCache = HashMap<String, List<LiveStream>>()
+    private var allChannelsCache: List<LiveStream>? = null
     private var selectedCategoryId: String? = null
+    private var searchQuery = ""
     private var focusedChannel: LiveStream? = null
     private var loaded = false
     private var loading = false
     private var pendingJumpToFavorites = false
+    private var pendingFocusGrid = false
+    private var channelLoadJob: Job? = null
+    private var searchJob: Job? = null
+    private var allChannelsFetch: Deferred<List<LiveStream>>? = null
+    private var paneErrorActive = false
 
     private var player: ExoPlayer? = null
     private var currentChannel: LiveStream? = null
@@ -86,8 +106,10 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         super.onViewCreated(view, savedInstanceState)
         app = App.from(requireContext())
 
+        browseRoot = view.findViewById(R.id.browse_root)
         categoryList = view.findViewById(R.id.category_list)
         channelGrid = view.findViewById(R.id.channel_grid)
+        searchInput = view.findViewById(R.id.search_input)
         progress = view.findViewById(R.id.live_progress)
         emptyText = view.findViewById(R.id.live_empty)
         miniPlayerView = view.findViewById(R.id.mini_player)
@@ -95,22 +117,21 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         fullscreenPlayerView = view.findViewById(R.id.fullscreen_player)
         fullscreenStatus = view.findViewById(R.id.fullscreen_status)
         playerStatus = view.findViewById(R.id.player_status)
-
-        // OK while fullscreen retries a dead stream (controller is disabled).
-        fullscreenPlayerView.setOnClickListener {
-            if (playbackFailed) currentChannel?.let(::startChannelStream)
-        }
         nowChannelName = view.findViewById(R.id.now_channel_name)
         nowChannelNumber = view.findViewById(R.id.now_channel_number)
         epgNow = view.findViewById(R.id.epg_now)
         epgNext = view.findViewById(R.id.epg_next)
 
+        // OK while fullscreen retries a dead stream (controller is disabled).
+        fullscreenPlayerView.setOnClickListener {
+            if (playbackFailed) currentChannel?.let(::startChannelStream)
+        }
+
         categoryAdapter = CategoryAdapter(
-            onFocused = { row -> selectCategory(row.id) },
-            onClicked = { row ->
-                selectCategory(row.id)
-                if (channelAdapter.itemCount > 0) channelGrid.requestFocus()
-            }
+            // Selection happens on OK only — reacting to focus would rebuild
+            // the channel pane on every hop of a held D-pad scroll.
+            onFocused = { },
+            onClicked = { row -> onCategoryClicked(row) }
         )
         categoryList.adapter = categoryAdapter
 
@@ -126,6 +147,21 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         // visible highlight; keep them unfocusable until they have content.
         categoryList.isFocusable = false
         channelGrid.isFocusable = false
+
+        searchInput.doAfterTextChanged { editable ->
+            onSearchTextChanged(editable?.toString().orEmpty())
+        }
+        searchInput.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_DONE && channelAdapter.itemCount > 0) {
+                hideKeyboard()
+                channelGrid.requestFocus()
+                true
+            } else {
+                // Let the IME handle Done (dismiss) when there is nothing to
+                // hand focus to — returning true would make the key feel dead.
+                false
+            }
+        }
 
         requireActivity().onBackPressedDispatcher.addCallback(viewLifecycleOwner, backCallback)
 
@@ -160,7 +196,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         }
     }
 
-    // ---- Catalog ----
+    // ---- Catalog: categories up front, channels on demand ----
 
     private fun load() {
         if (loading || loaded) return
@@ -176,28 +212,24 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         viewLifecycleOwner.lifecycleScope.launch {
             try {
                 categories = app.api.getLiveCategories()
-                allChannels = app.api.getLiveStreams()
-                channelsByCategory = allChannels.groupBy { it.categoryId ?: "" }
                 loaded = true
                 progress.visibility = View.GONE
 
                 categoryAdapter.submit(buildCategoryRows())
                 categoryList.isFocusable = true
+                categoryList.selectedPosition = 0
 
-                val initialCategory = when {
-                    pendingJumpToFavorites -> FAVORITES_CATEGORY_ID
-                    favoriteChannels().isNotEmpty() -> FAVORITES_CATEGORY_ID
-                    else -> categories.firstOrNull()?.id ?: FAVORITES_CATEGORY_ID
-                }
-                selectCategory(initialCategory)
-                // Keep the rail's leanback selection in sync so first focus
-                // entry lands on the category actually displayed.
-                categoryAdapter.positionOf(initialCategory)
-                    .takeIf { it >= 0 }
-                    ?.let { categoryList.selectedPosition = it }
-                if (pendingJumpToFavorites) {
-                    pendingJumpToFavorites = false
-                    focusFavoritesRow()
+                when {
+                    pendingJumpToFavorites -> {
+                        pendingJumpToFavorites = false
+                        pendingFocusGrid = true
+                        selectCategory(FAVORITES_CATEGORY_ID)
+                    }
+                    // Don't clobber a search the user started while categories
+                    // were still loading.
+                    searchQuery.isNotBlank() -> Unit
+                    app.favorites.all().isNotEmpty() -> selectCategory(FAVORITES_CATEGORY_ID)
+                    else -> showPaneHint(getString(R.string.live_pick_category))
                 }
             } catch (e: Exception) {
                 progress.visibility = View.GONE
@@ -212,46 +244,266 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         }
     }
 
-    private fun clearRetryAffordance() {
-        emptyText.isFocusable = false
-        emptyText.setOnClickListener(null)
-        emptyText.isClickable = false
+    private fun buildCategoryRows(): List<CategoryRow> {
+        val rows = mutableListOf(
+            CategoryRow(FAVORITES_CATEGORY_ID, getString(R.string.category_favorites))
+        )
+        // Providers usually ship their own "ALL" category; synthesize one only
+        // when they don't.
+        if (categories.none { isAllLikeName(it.name) }) {
+            rows.add(CategoryRow(ALL_CATEGORY_ID, getString(R.string.category_all)))
+        }
+        categories.mapTo(rows) {
+            CategoryRow(it.id ?: "", it.name ?: getString(R.string.category_unnamed))
+        }
+        return rows
     }
 
-    private fun buildCategoryRows(): List<CategoryRow> =
-        listOf(CategoryRow(FAVORITES_CATEGORY_ID, getString(R.string.category_favorites))) +
-            categories.map { CategoryRow(it.id ?: "", it.name ?: getString(R.string.category_unnamed)) }
+    private fun isAllLikeName(name: String?): Boolean {
+        val normalized = name?.trim()?.lowercase() ?: return false
+        return normalized == "all" ||
+            normalized == "all channels" ||
+            ALL_LIKE_PREFIX.matches(normalized)
+    }
 
-    private fun favoriteChannels(): List<LiveStream> =
-        allChannels.filter { channel -> channel.streamId?.let(app.favorites::isFavorite) == true }
+    private fun onCategoryClicked(row: CategoryRow) {
+        clearSearchText()
+        pendingFocusGrid = true
+        selectCategory(row.id)
+    }
+
+    /** Clears the search box without the watcher firing a redundant reload. */
+    private fun clearSearchText() {
+        // The watcher's early-return means it will never reach its own cancel —
+        // a surviving search job would later stomp the pane with its spinner
+        // or error.
+        searchJob?.cancel()
+        searchQuery = ""
+        if (searchInput.text.isNotEmpty()) searchInput.setText("")
+    }
+
+    private fun hideKeyboard() {
+        val imm = requireContext()
+            .getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+        imm?.hideSoftInputFromWindow(searchInput.windowToken, 0)
+    }
 
     private fun selectCategory(categoryId: String) {
         selectedCategoryId = categoryId
         categoryAdapter.setSelectedId(categoryId)
-        refreshChannels()
+        loadChannelsFor(categoryId)
     }
 
-    private fun refreshChannels() {
-        val channels = if (selectedCategoryId == FAVORITES_CATEGORY_ID) {
-            favoriteChannels()
-        } else {
-            channelsByCategory[selectedCategoryId].orEmpty()
+    private fun loadChannelsFor(categoryId: String) {
+        channelLoadJob?.cancel()
+        if (searchQuery.isNotBlank()) return // search owns the pane right now
+        cachedChannelsFor(categoryId)?.let {
+            displayChannels(it)
+            return
         }
+        showPaneLoading()
+        channelLoadJob = viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                val channels = when (categoryId) {
+                    FAVORITES_CATEGORY_ID -> fetchAllChannels()
+                        .filter { it.streamId?.let(app.favorites::isFavorite) == true }
+                    ALL_CATEGORY_ID -> fetchAllChannels()
+                    else -> app.api.getLiveStreams(categoryId)
+                        .also { channelCache[categoryId] = it }
+                }
+                ensureActive()
+                if (selectedCategoryId == categoryId && searchQuery.isBlank()) {
+                    displayChannels(channels)
+                } else {
+                    // Superseded (new category or a search took over) — the
+                    // focus handoff must not fire on someone else's display.
+                    pendingFocusGrid = false
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (selectedCategoryId == categoryId && searchQuery.isBlank()) {
+                    showPaneError(e)
+                } else {
+                    pendingFocusGrid = false
+                }
+            }
+        }
+    }
+
+    /** Cached list for a category, or null when it still needs a fetch. */
+    private fun cachedChannelsFor(categoryId: String): List<LiveStream>? = when (categoryId) {
+        FAVORITES_CATEGORY_ID -> allChannelsCache
+            ?.filter { it.streamId?.let(app.favorites::isFavorite) == true }
+        ALL_CATEGORY_ID -> allChannelsCache
+        else -> channelCache[categoryId]
+    }
+
+    // Shared between search and Favorites/All — a single in-flight fetch is
+    // reused so the (large) full catalog is never downloaded twice in parallel.
+    private suspend fun fetchAllChannels(): List<LiveStream> {
+        allChannelsCache?.let { return it }
+        val existing = allChannelsFetch
+        val deferred = if (existing != null && existing.isActive) {
+            existing
+        } else {
+            viewLifecycleOwner.lifecycleScope.async {
+                app.api.getLiveStreams().also { allChannelsCache = it }
+            }.also { allChannelsFetch = it }
+        }
+        return try {
+            deferred.await()
+        } catch (e: CancellationException) {
+            // The AWAITER was cancelled — the shared fetch is still running
+            // and must stay registered for the next caller.
+            throw e
+        } catch (e: Exception) {
+            if (allChannelsFetch === deferred) allChannelsFetch = null
+            throw e
+        }
+    }
+
+    private fun displayChannels(channels: List<LiveStream>, emptyMessage: String? = null) {
+        progress.visibility = View.GONE
         // The previously focused channel may no longer be on screen — a Yellow
         // press must not toggle an invisible item.
         if (focusedChannel != null && channels.none { it.streamId == focusedChannel?.streamId }) {
             focusedChannel = null
         }
+        val gridHadFocus = channelGrid.hasFocus()
         channelAdapter.submit(channels)
         channelGrid.isFocusable = channels.isNotEmpty()
-
-        val showFavoritesHint = channels.isEmpty() && selectedCategoryId == FAVORITES_CATEGORY_ID
-        emptyText.text = when {
-            showFavoritesHint -> getString(R.string.favorites_empty_hint)
-            channels.isEmpty() -> getString(R.string.category_empty)
-            else -> ""
+        // If the grid empties out from under the user (e.g. Yellow removed the
+        // last favorite), hand focus to the rail instead of letting the
+        // framework warp it to the top of the window.
+        if (channels.isEmpty() && gridHadFocus) {
+            categoryList.requestFocus()
         }
-        emptyText.visibility = if (channels.isEmpty() && loaded) View.VISIBLE else View.GONE
+
+        if (channels.isEmpty()) {
+            val showFavoritesHint =
+                searchQuery.isBlank() && selectedCategoryId == FAVORITES_CATEGORY_ID
+            showPaneHint(
+                emptyMessage ?: if (showFavoritesHint) {
+                    getString(R.string.favorites_empty_hint)
+                } else {
+                    getString(R.string.category_empty)
+                }
+            )
+        } else {
+            emptyText.visibility = View.GONE
+        }
+
+        if (pendingFocusGrid) {
+            pendingFocusGrid = false
+            // Never steal focus from the search box while the user is typing.
+            if (!searchInput.hasFocus()) {
+                channelGrid.post {
+                    if (channelAdapter.itemCount > 0) {
+                        channelGrid.selectedPosition = 0
+                        channelGrid.requestFocus()
+                    } else {
+                        categoryList.requestFocus()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun showPaneLoading() {
+        clearRetryAffordance()
+        emptyText.visibility = View.GONE
+        progress.visibility = View.VISIBLE
+    }
+
+    private fun showPaneHint(text: String) {
+        clearRetryAffordance()
+        progress.visibility = View.GONE
+        emptyText.text = text
+        emptyText.visibility = View.VISIBLE
+    }
+
+    private fun showPaneError(e: Exception) {
+        pendingFocusGrid = false
+        progress.visibility = View.GONE
+        // Clear the stale list — leaving the previous category's channels
+        // interactive under the error text misleads about what failed.
+        val gridHadFocus = channelGrid.hasFocus()
+        channelAdapter.submit(emptyList())
+        channelGrid.isFocusable = false
+        emptyText.text = getString(R.string.error_loading_retry, e.message ?: "unknown error")
+        emptyText.visibility = View.VISIBLE
+        paneErrorActive = true
+        // emptyText sits OUTSIDE browse_root, so the fullscreen focus block
+        // doesn't cover it — keep it unfocusable until fullscreen exits.
+        emptyText.isFocusable = !isFullscreen
+        emptyText.setOnClickListener { retryPane() }
+        if (gridHadFocus && !isFullscreen) emptyText.requestFocus()
+    }
+
+    private fun retryPane() {
+        // Unfocusing the retry text while it holds focus would warp focus to
+        // the top of the window; hand it to the rail and re-enter the grid
+        // once the retried load displays.
+        if (emptyText.hasFocus()) {
+            if (categoryList.isFocusable) {
+                categoryList.requestFocus()
+            } else {
+                activity?.findViewById<View>(R.id.tab_live)?.requestFocus()
+            }
+        }
+        clearRetryAffordance()
+        if (searchQuery.isNotBlank()) {
+            val query = searchQuery
+            searchQuery = ""
+            onSearchTextChanged(query)
+            // Must be armed AFTER onSearchTextChanged, which clears the flag.
+            pendingFocusGrid = true
+        } else {
+            pendingFocusGrid = true
+            selectedCategoryId?.let(::loadChannelsFor)
+        }
+    }
+
+    private fun clearRetryAffordance() {
+        paneErrorActive = false
+        emptyText.isFocusable = false
+        emptyText.setOnClickListener(null)
+        emptyText.isClickable = false
+    }
+
+    // ---- Search ----
+
+    private fun onSearchTextChanged(text: String) {
+        val query = text.trim()
+        if (query == searchQuery) return
+        searchQuery = query
+        searchJob?.cancel()
+        if (query.isBlank()) {
+            selectedCategoryId?.let(::loadChannelsFor)
+                ?: showPaneHint(getString(R.string.live_pick_category))
+            return
+        }
+        // Search owns the pane now: stop any in-flight category load and make
+        // sure its focus handoff can't fire on our results.
+        channelLoadJob?.cancel()
+        pendingFocusGrid = false
+        searchJob = viewLifecycleOwner.lifecycleScope.launch {
+            delay(SEARCH_DEBOUNCE_MS)
+            showPaneLoading()
+            val all = try {
+                fetchAllChannels()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                showPaneError(e)
+                return@launch
+            }
+            ensureActive()
+            if (searchQuery != query) return@launch
+            val matches = all.filter { it.name?.contains(query, ignoreCase = true) == true }
+            displayChannels(matches, emptyMessage = getString(R.string.search_no_matches, query))
+        }
     }
 
     // ---- Playback ----
@@ -450,6 +702,10 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         fullscreenStatus.visibility = playerStatus.visibility
         StyledPlayerView.switchTargetView(exo, miniPlayerView, fullscreenPlayerView)
         fullscreenPlayerView.requestFocus()
+        // FocusFinder ignores z-order: without this, D-pad presses could land
+        // on the hidden rail/list/search box behind the video (OK would even
+        // open the keyboard over playback).
+        browseRoot.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
         backCallback.isEnabled = true
     }
 
@@ -460,6 +716,8 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         fullscreenContainer.visibility = View.GONE
         fullscreenStatus.visibility = View.GONE
         (activity as? MainActivity)?.setTabRailVisible(true)
+        browseRoot.descendantFocusability = ViewGroup.FOCUS_AFTER_DESCENDANTS
+        if (paneErrorActive) emptyText.isFocusable = true
         backCallback.isEnabled = false
         if (channelAdapter.itemCount > 0) {
             channelGrid.requestFocus()
@@ -490,8 +748,8 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
             ),
             Toast.LENGTH_SHORT
         ).show()
-        if (selectedCategoryId == FAVORITES_CATEGORY_ID) {
-            refreshChannels()
+        if (selectedCategoryId == FAVORITES_CATEGORY_ID && searchQuery.isBlank()) {
+            cachedChannelsFor(FAVORITES_CATEGORY_ID)?.let(::displayChannels)
         } else {
             channelAdapter.notifyChannelChanged(streamId)
         }
@@ -520,29 +778,23 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
             load()
             return
         }
+        clearSearchText()
+        pendingFocusGrid = true
+        categoryAdapter.positionOf(FAVORITES_CATEGORY_ID)
+            .takeIf { it >= 0 }
+            ?.let { categoryList.selectedPosition = it }
         selectCategory(FAVORITES_CATEGORY_ID)
-        focusFavoritesRow()
-    }
-
-    private fun focusFavoritesRow() {
-        val position = categoryAdapter.positionOf(FAVORITES_CATEGORY_ID)
-        if (position >= 0) {
-            categoryList.selectedPosition = position
-        }
-        categoryList.post {
-            if (channelAdapter.itemCount > 0) {
-                channelGrid.selectedPosition = 0
-                channelGrid.requestFocus()
-            } else {
-                categoryList.requestFocus()
-            }
-        }
     }
 
     companion object {
         const val FAVORITES_CATEGORY_ID = "__favorites__"
+        const val ALL_CATEGORY_ID = "__all__"
         private const val MAX_RETRIES = 3
         private const val RETRY_DELAY_MS = 3000L
+        private const val SEARCH_DEBOUNCE_MS = 250L
+
+        // "all", "all | channels", "all - live" … but not "allstar".
+        private val ALL_LIKE_PREFIX = Regex("^all[ |_-].*$")
 
         private val RESIZE_MODES = listOf(
             AspectRatioFrameLayout.RESIZE_MODE_FIT to R.string.aspect_fit,
