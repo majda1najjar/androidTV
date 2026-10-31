@@ -76,8 +76,11 @@ class XtreamApiClient(private val session: SessionManager) {
             if (categoryId != null) mapOf("category_id" to categoryId) else emptyMap()
         ).filter { it.streamId != null }
 
-    suspend fun getVodStreams(): List<VodStream> =
-        fetchList<VodStream>("get_vod_streams").filter { it.streamId != null }
+    suspend fun getVodStreams(categoryId: String? = null): List<VodStream> =
+        fetchList<VodStream>(
+            "get_vod_streams",
+            if (categoryId != null) mapOf("category_id" to categoryId) else emptyMap()
+        ).filter { it.streamId != null }
 
     suspend fun getSeries(): List<Series> =
         fetchList<Series>("get_series").filter { it.seriesId != null }

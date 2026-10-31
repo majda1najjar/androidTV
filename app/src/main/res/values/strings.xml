@@ -38,7 +38,8 @@
     <string name="favorites_removed">Removed “%1$s” from Favorites</string>
 
     <!-- Movies / Series -->
-    <string name="movies_empty">No movies available.</string>
+    <string name="movies_all">All Movies</string>
+    <string name="movies_empty">No movies available in this category.</string>
     <string name="series_empty">No TV shows available.</string>
     <string name="series_no_episodes">No episodes found for this season.</string>
     <string name="season_label">Season %1$s</string>

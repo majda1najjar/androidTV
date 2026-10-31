@@ -95,6 +95,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     private var retryJob: Job? = null
     private var epgJob: Job? = null
     private var resizeModeIndex = 0
+    private var inactivityJob: Job? = null
 
     private val backCallback = object : OnBackPressedCallback(false) {
         override fun handleOnBackPressed() {
@@ -172,6 +173,12 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     override fun onResume() {
         super.onResume()
         if (!loaded) load()
+        onUserActivity()
+    }
+
+    override fun onPause() {
+        inactivityJob?.cancel()
+        super.onPause()
     }
 
     override fun onStart() {
@@ -193,6 +200,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         } else {
             if (!loaded) load()
             resumePlayback()
+            onUserActivity()
         }
     }
 
@@ -544,6 +552,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         exo.setMediaItem(MediaItem.fromUri(url))
         exo.prepare()
         exo.playWhenReady = true
+        onUserActivity()
     }
 
     private fun ensurePlayer(): ExoPlayer {
@@ -618,6 +627,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
     }
 
     private fun releasePlayer() {
+        inactivityJob?.cancel()
         retryJob?.cancel()
         player?.release()
         player = null
@@ -690,9 +700,23 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
 
     // ---- Fullscreen ----
 
+    /** Any remote, keyboard, touch or pointer input starts a fresh idle period. */
+    fun onUserActivity() {
+        inactivityJob?.cancel()
+        if (!isResumed || isHidden || isFullscreen || currentChannel == null || player == null) return
+        inactivityJob = viewLifecycleOwner.lifecycleScope.launch {
+            delay(AUTO_FULLSCREEN_DELAY_MS)
+            if (isResumed && !isHidden && !isFullscreen && currentChannel != null && player != null) {
+                hideKeyboard()
+                enterFullscreen()
+            }
+        }
+    }
+
     private fun enterFullscreen() {
         val exo = player ?: return
         if (isFullscreen) return
+        inactivityJob?.cancel()
         isFullscreen = true
         (activity as? MainActivity)?.setTabRailVisible(false)
         fullscreenContainer.visibility = View.VISIBLE
@@ -706,6 +730,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         // on the hidden rail/list/search box behind the video (OK would even
         // open the keyboard over playback).
         browseRoot.descendantFocusability = ViewGroup.FOCUS_BLOCK_DESCENDANTS
+        emptyText.isFocusable = false
         backCallback.isEnabled = true
     }
 
@@ -724,6 +749,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         } else {
             categoryList.requestFocus()
         }
+        onUserActivity()
     }
 
     // ---- Hardware color keys ----
@@ -792,6 +818,7 @@ class LiveTvFragment : Fragment(R.layout.fragment_live) {
         private const val MAX_RETRIES = 3
         private const val RETRY_DELAY_MS = 3000L
         private const val SEARCH_DEBOUNCE_MS = 250L
+        private const val AUTO_FULLSCREEN_DELAY_MS = 45_000L
 
         // "all", "all | channels", "all - live" … but not "allstar".
         private val ALL_LIKE_PREFIX = Regex("^all[ |_-].*$")

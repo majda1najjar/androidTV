@@ -3,6 +3,7 @@ package com.xtreamtv.ui
 import android.content.Intent
 import android.os.Bundle
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.widget.TextView
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
@@ -87,6 +88,21 @@ class MainActivity : FragmentActivity() {
     fun setTabRailVisible(visible: Boolean) {
         findViewById<android.view.View>(R.id.tab_rail).visibility =
             if (visible) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        liveFragment()?.onUserActivity()
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        liveFragment()?.onUserActivity()
+        return super.dispatchTouchEvent(event)
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        liveFragment()?.onUserActivity()
+        return super.dispatchGenericMotionEvent(event)
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {

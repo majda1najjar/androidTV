@@ -1,0 +1,44 @@
+name: Build Fire TV download
+on:
+  push:
+    branches: [release/firetv-2026-10-31]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: firetv-download
+  cancel-in-progress: true
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Build APK
+        run: bash gradlew --no-daemon :app:assembleDebug :app:lintDebug
+      - name: Save build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-reports
+          path: app/build/reports/
+          if-no-files-found: ignore
+      - name: Publish installable APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk XtreamTV.apk
+          sha256sum XtreamTV.apk > XtreamTV.apk.sha256
+          cat > release-notes.md <<'NOTES'
+          Android / Fire OS personal sideload build, signed with an Android debug certificate.
+          Includes provider movie categories and fullscreen after 45 seconds of inactivity on Live TV.
+          Download XtreamTV.apk directly in Downloader.
+          This is not a Samsung Tizen or Amazon Vega OS app. Playback requires your own IPTV provider credentials.
+          Built and lint-checked by GitHub Actions; physical-device playback has not yet been tested.
+          NOTES
+          gh release create firetv-2026-10-31 XtreamTV.apk XtreamTV.apk.sha256 --target "$GITHUB_SHA" --title "XtreamTV — Movies categories and idle fullscreen" --notes-file release-notes.md

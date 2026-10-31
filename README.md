@@ -10,7 +10,14 @@ ExoPlayer.
   `EncryptedSharedPreferences`; app boots straight to the dashboard when
   credentials exist.
 - **Three-tab dashboard** — Live TV (category rail + channel grid), Movies
-  (poster grid), TV Shows (poster grid → seasons/episodes browser).
+  (category rail + poster grid), TV Shows (poster grid → seasons/episodes browser).
+- **Movie categories** — select a provider category with OK to load its movies;
+  All Movies shows the complete catalog. Results are cached while browsing,
+  and failed loads offer a retry.
+- **Idle fullscreen** — a selected live channel expands from preview to fullscreen
+  after 45 seconds without remote, keyboard, touch, or pointer input. Back returns
+  to browsing and restarts the countdown. The timer stops outside Live TV and
+  while the app is in the background.
 - **100% D-pad driven** — every focusable item gets a bright border + scale-up
   focus state; explicit `nextFocusDown` chains on the login form.
 - **Hardware color keys** (dashboard *and* player):

@@ -11,90 +11,129 @@ import androidx.lifecycle.lifecycleScope
 import com.xtreamtv.App
 import com.xtreamtv.R
 import com.xtreamtv.data.model.VodStream
+import com.xtreamtv.ui.common.CategoryAdapter
+import com.xtreamtv.ui.common.CategoryRow
 import com.xtreamtv.ui.common.PosterAdapter
 import com.xtreamtv.ui.common.PosterItem
 import com.xtreamtv.ui.player.PlayerActivity
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
-class MoviesFragment : Fragment(R.layout.fragment_grid) {
-
+class MoviesFragment : Fragment(R.layout.fragment_movies) {
     private lateinit var app: App
     private lateinit var grid: VerticalGridView
+    private lateinit var categoryList: VerticalGridView
     private lateinit var progress: ProgressBar
     private lateinit var emptyText: TextView
     private lateinit var adapter: PosterAdapter
-
+    private lateinit var categoryAdapter: CategoryAdapter
+    private var categories: List<CategoryRow>? = null
+    private val cache = mutableMapOf<String, List<VodStream>>()
     private var moviesById: Map<Int, VodStream> = emptyMap()
-    private var loaded = false
-    private var loading = false
+    private var selectedCategoryId = ALL_CATEGORY_ID
+    private var loadJob: Job? = null
+    private var categoryJob: Job? = null
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
         app = App.from(requireContext())
-
+        selectedCategoryId = savedInstanceState?.getString(STATE_CATEGORY) ?: selectedCategoryId
         grid = view.findViewById(R.id.poster_grid)
+        categoryList = view.findViewById(R.id.category_list)
         progress = view.findViewById(R.id.grid_progress)
         emptyText = view.findViewById(R.id.grid_empty)
-
-        adapter = PosterAdapter { item -> play(item) }
-        grid.setNumColumns(GRID_COLUMNS)
+        adapter = PosterAdapter { play(it) }
+        grid.setNumColumns(4)
         grid.adapter = adapter
-        // Empty leanback grids swallow D-pad focus invisibly.
         grid.isFocusable = false
-
-        load()
+        categoryAdapter = CategoryAdapter(onFocused = {}, onClicked = { selectCategory(it.id, true) })
+        categoryList.adapter = categoryAdapter
+        categoryList.isFocusable = false
+        loadCategories()
     }
 
-    override fun onResume() {
-        super.onResume()
-        if (!loaded) load()
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putString(STATE_CATEGORY, selectedCategoryId)
     }
 
-    override fun onHiddenChanged(hidden: Boolean) {
-        super.onHiddenChanged(hidden)
-        if (!hidden && !loaded) load()
-    }
-
-    private fun load() {
-        if (loading || loaded) return
-        loading = true
-        // Hand focus to our tab before unfocusing the retry text, or Android
-        // teleports it to the first focusable in the activity.
-        if (emptyText.hasFocus()) {
-            activity?.findViewById<View>(R.id.tab_movies)?.requestFocus()
+    private fun showLoading() {
+        if (emptyText.hasFocus() || grid.hasFocus()) {
+            if (categoryList.isFocusable) categoryList.requestFocus()
+            else activity?.findViewById<View>(R.id.tab_movies)?.requestFocus()
         }
         emptyText.isFocusable = false
         emptyText.setOnClickListener(null)
         emptyText.isClickable = false
-        progress.visibility = View.VISIBLE
         emptyText.visibility = View.GONE
-        viewLifecycleOwner.lifecycleScope.launch {
+        progress.visibility = View.VISIBLE
+        adapter.submit(emptyList())
+        moviesById = emptyMap()
+        grid.isFocusable = false
+    }
+
+    private fun loadCategories() {
+        categoryJob?.cancel()
+        showLoading()
+        categoryJob = viewLifecycleOwner.lifecycleScope.launch {
             try {
-                val movies = app.api.getVodStreams()
-                loaded = true
-                moviesById = movies.filter { it.streamId != null }.associateBy { it.streamId!! }
-                adapter.submit(
-                    movies.mapNotNull { movie ->
-                        movie.streamId?.let { id ->
-                            PosterItem(id, movie.name.orEmpty(), movie.icon)
+                val rows = categories ?: (listOf(CategoryRow(ALL_CATEGORY_ID, getString(R.string.movies_all))) +
+                    app.api.getVodCategories().mapNotNull { category ->
+                        category.id?.takeIf { it.isNotBlank() }?.let {
+                            CategoryRow(it, category.name?.takeIf { name -> name.isNotBlank() }
+                                ?: getString(R.string.category_unnamed))
                         }
-                    }
-                )
-                grid.isFocusable = movies.isNotEmpty()
-                progress.visibility = View.GONE
-                emptyText.visibility = if (movies.isEmpty()) View.VISIBLE else View.GONE
-                emptyText.text = getString(R.string.movies_empty)
+                    }.distinctBy { it.id }).also { categories = it }
+                ensureActive()
+                categoryAdapter.submit(rows)
+                categoryList.isFocusable = true
+                if (rows.none { it.id == selectedCategoryId }) selectedCategoryId = ALL_CATEGORY_ID
+                categoryList.selectedPosition = rows.indexOfFirst { it.id == selectedCategoryId }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
+                showError(e) { loadCategories() }
+                return@launch
+            }
+            selectCategory(selectedCategoryId, false)
+        }
+    }
+
+    private fun selectCategory(id: String, focusGrid: Boolean) {
+        loadJob?.cancel()
+        selectedCategoryId = id
+        categoryAdapter.setSelectedId(id)
+        showLoading()
+        loadJob = viewLifecycleOwner.lifecycleScope.launch {
+            try {
+                val movies = cache[id] ?: app.api.getVodStreams(id.takeUnless { it == ALL_CATEGORY_ID })
+                    .also { cache[id] = it }
+                ensureActive()
+                moviesById = movies.associateBy { it.streamId!! }
+                adapter.submit(movies.map { PosterItem(it.streamId!!, it.name.orEmpty(), it.icon) })
+                grid.isFocusable = movies.isNotEmpty()
+                grid.selectedPosition = 0
                 progress.visibility = View.GONE
-                emptyText.text = getString(R.string.error_loading_retry, e.message ?: "unknown error")
-                emptyText.visibility = View.VISIBLE
-                emptyText.isFocusable = true
-                emptyText.setOnClickListener { load() }
-                emptyText.requestFocus()
-            } finally {
-                loading = false
+                emptyText.text = getString(R.string.movies_empty)
+                emptyText.visibility = if (movies.isEmpty()) View.VISIBLE else View.GONE
+                if (focusGrid && movies.isNotEmpty() && isResumed && !isHidden) grid.requestFocus()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                showError(e) { selectCategory(id, true) }
             }
         }
+    }
+
+    private fun showError(error: Exception, retry: () -> Unit) {
+        progress.visibility = View.GONE
+        emptyText.text = getString(R.string.error_loading_retry, error.message ?: "unknown error")
+        emptyText.visibility = View.VISIBLE
+        emptyText.isFocusable = true
+        emptyText.setOnClickListener { retry() }
+        if (isResumed && !isHidden) emptyText.requestFocus()
     }
 
     private fun play(item: PosterItem) {
@@ -109,6 +148,7 @@ class MoviesFragment : Fragment(R.layout.fragment_grid) {
     }
 
     companion object {
-        private const val GRID_COLUMNS = 6
+        private const val ALL_CATEGORY_ID = "__all_movies__"
+        private const val STATE_CATEGORY = "movie_category"
     }
 }
