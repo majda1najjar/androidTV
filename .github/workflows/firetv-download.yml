@@ -18,7 +18,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK packages
+        run: sdkmanager 'platforms;android-34' 'build-tools;34.0.0'
       - name: Build APK
         run: bash gradlew --no-daemon :app:assembleDebug :app:lintDebug
       - name: Save build reports
