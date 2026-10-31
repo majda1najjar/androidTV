@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- ExoPlayer bundles an offline download service, but this streaming-only
+         app never declares or starts it and does not post notifications. -->
+    <issue id="NotificationPermission">
+        <ignore regexp=".*com.google.android.exoplayer2.offline.DownloadService.*" />
+    </issue>
+</lint>

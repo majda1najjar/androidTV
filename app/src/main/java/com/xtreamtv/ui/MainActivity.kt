@@ -90,9 +90,9 @@ class MainActivity : FragmentActivity() {
             if (visible) android.view.View.VISIBLE else android.view.View.GONE
     }
 
-    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+    override fun onUserInteraction() {
+        super.onUserInteraction()
         liveFragment()?.onUserActivity()
-        return super.dispatchKeyEvent(event)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
